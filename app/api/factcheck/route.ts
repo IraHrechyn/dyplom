@@ -191,6 +191,7 @@ async function collectEvidenceHits(
   plan: SearchPlan,
   relatedUrls: string[],
   relatedTitles: string[],
+  beforeDate?: string | null,
 ): Promise<SearchHit[]> {
   const hits: SearchHit[] = []
   const fallbackUk = extractKeywordQuery(text, 8)
@@ -206,13 +207,22 @@ async function collectEvidenceHits(
     hits.push(...relatedUrls.slice(0, 3).map((u, i) => ({ url: u, title: relatedTitles[i] })))
   }
 
-  
+  const toDate =
+    beforeDate && /^\d{4}-\d{2}-\d{2}$/.test(beforeDate) ? beforeDate : undefined
   const qUk = ukQueries[0] || ""
   const qEn = enQueries[0] || ""
+  const qUkDated = toDate && qUk ? `${qUk} before:${toDate}` : qUk
+  const qEnDated = toDate && qEn ? `${qEn} before:${toDate}` : qEn
+  const newsParamsUk: Record<string, string> = { q: qUk, language: "uk" }
+  if (toDate) newsParamsUk.to = toDate
   const batches = await Promise.all([
-    qUk ? googleNewsRssSearch(qUk, { hl: "uk", gl: "UA", ceid: "UA:uk" }, 4) : Promise.resolve([]),
-    qUk ? newsApiFetch({ q: qUk, language: "uk" }, 3) : Promise.resolve([]),
-    qEn ? googleNewsRssSearch(qEn, { hl: "en", gl: "US", ceid: "US:en" }, 2) : Promise.resolve([]),
+    qUkDated
+      ? googleNewsRssSearch(qUkDated, { hl: "uk", gl: "UA", ceid: "UA:uk" }, 4)
+      : Promise.resolve([]),
+    qUk ? newsApiFetch(newsParamsUk, 3) : Promise.resolve([]),
+    qEnDated
+      ? googleNewsRssSearch(qEnDated, { hl: "en", gl: "US", ceid: "US:en" }, 2)
+      : Promise.resolve([]),
   ])
 
   for (const b of batches) hits.push(...b)
@@ -241,6 +251,61 @@ async function gatherSourceTexts(
 function clamp01(n: number) {
   if (!Number.isFinite(n)) return 0
   return Math.max(0, Math.min(1, n))
+}
+
+function normalizePercents(truth: number, fake: number): { truthPercent: number; fakePercent: number } {
+  let t = Number.isFinite(truth) ? truth : 0
+  let f = Number.isFinite(fake) ? fake : 0
+  t = Math.max(0, Math.min(100, t))
+  f = Math.max(0, Math.min(100, f))
+  const sum = t + f
+  if (sum <= 0) return { truthPercent: 50, fakePercent: 50 }
+  if (Math.abs(sum - 100) > 0.05) {
+    t = (t / sum) * 100
+    f = 100 - t
+  }
+  return {
+    truthPercent: Math.round(t * 10) / 10,
+    fakePercent: Math.round(f * 10) / 10,
+  }
+}
+
+function normalizeMatchText(s: string): string {
+  return String(s || "")
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim()
+}
+
+function quoteMatchesSource(quote: string, sourceText: string): boolean {
+  const q = normalizeMatchText(quote)
+  const src = normalizeMatchText(sourceText)
+  if (q.length < 12 || !src) return false
+  if (src.includes(q)) return true
+  const head = q.slice(0, Math.min(80, q.length))
+  return head.length >= 12 && src.includes(head)
+}
+
+function verifyCitations(
+  citations: { sourceIndex: number; url: string; quote: string }[],
+  sourceTexts: { url: string; title?: string; text: string; publisher?: string }[],
+): { sourceIndex: number; url: string; quote: string }[] {
+  const out: { sourceIndex: number; url: string; quote: string }[] = []
+  for (const c of citations) {
+    const idx = sourceTexts.findIndex(
+      (s) => s.url === c.url || s.url.includes(c.url) || c.url.includes(s.url),
+    )
+    if (idx < 0) continue
+    const src = sourceTexts[idx]
+    const blob = `${src.title ?? ""}\n${src.publisher ?? ""}\n${src.text}`
+    if (!quoteMatchesSource(c.quote, blob)) continue
+    out.push({
+      sourceIndex: idx,
+      url: src.url,
+      quote: c.quote.slice(0, 220),
+    })
+  }
+  return out
 }
 
 function computeSummary(claims: FactCheckClaim[]) {
@@ -272,11 +337,6 @@ function dedupeHits(hits: SearchHit[], limit: number): SearchHit[] {
   return out
 }
 
-function clip(s: string, max = 1800) {
-  const t = String(s ?? "")
-  return t.length <= max ? t : t.slice(0, max) + "\n…(truncated)…"
-}
-
 function buildFactCheckPayload(
   llm: LlmConfig,
   parsed: any,
@@ -285,11 +345,19 @@ function buildFactCheckPayload(
   const hasEvidence = sourceTexts.length > 0
   const plausibilityOnly = hasEvidence ? false : Boolean(parsed?.plausibility_only)
   const overallIn = parsed?.overall ?? {}
+  const normalized = normalizePercents(
+    Number(overallIn?.truth_percent ?? 0),
+    Number(overallIn?.fake_percent ?? 0),
+  )
+  let overallVerdict = overallIn?.verdict
+  if (!hasEvidence && (overallVerdict === "LIKELY_TRUE" || overallVerdict === "LIKELY_FALSE")) {
+    overallVerdict = "NOT_ENOUGH_INFO"
+  }
   const overall = {
-    truthPercent: Number(overallIn?.truth_percent ?? 0),
-    fakePercent: Number(overallIn?.fake_percent ?? 0),
+    truthPercent: normalized.truthPercent,
+    fakePercent: normalized.fakePercent,
     confidence: clamp01(Number(overallIn?.confidence ?? 0)),
-    verdict: overallIn?.verdict,
+    verdict: overallVerdict,
     summary: String(overallIn?.summary ?? "").trim(),
   }
 
@@ -304,26 +372,26 @@ function buildFactCheckPayload(
   const claims: FactCheckClaim[] = claimsIn
     .map((c: any) => {
       const ev = Array.isArray(c?.evidence) ? c.evidence : []
-      const citations = ev
+      const rawCitations = ev
         .map((e: any) => ({
           sourceIndex: -1,
           url: String(e?.url ?? "").trim(),
           quote: String(e?.quote ?? "").trim(),
         }))
         .filter((x: any) => x.url && x.quote)
-      let confidence = clamp01(Number(c?.confidence ?? 0))
-      const verdict = c?.status
-      if (verdict === "SUPPORTED") {
-        const floor = citations.length ? 0.9 : 0.82
-        confidence = Math.max(confidence, floor)
-      } else if (verdict === "CONTRADICTED") {
-        const floor = citations.length ? 0.88 : 0.8
-        confidence = Math.max(confidence, floor)
+      const citations = verifyCitations(rawCitations, sourceTexts)
+      const confidence = clamp01(Number(c?.confidence ?? 0))
+      let verdict = c?.status
+      if (
+        (verdict === "SUPPORTED" || verdict === "CONTRADICTED") &&
+        citations.length === 0
+      ) {
+        verdict = "NOT_ENOUGH_INFO"
       }
       return {
         claim: String(c?.claim ?? "").trim(),
         verdict,
-        confidence: clamp01(confidence),
+        confidence,
         citations,
         note: c?.reason ? String(c.reason).trim() : undefined,
       }
@@ -399,7 +467,7 @@ export async function POST(req: NextRequest) {
   const publishedAt = String(body.publishedAt ?? "").trim() || null
   const referenceDate = String(body.referenceDate ?? "").trim() || publishedAt
 
-  const truncatedArticle = text.slice(0, 2_500)
+  const truncatedArticle = text.slice(0, 1_800)
 
   const latinQ = extractLatinQuery(truncatedArticle, 6)
   const plan: SearchPlan = {
@@ -411,7 +479,15 @@ export async function POST(req: NextRequest) {
 
   const relatedUrls = Array.isArray(body.relatedUrls) ? body.relatedUrls.filter(Boolean) : []
   const relatedTitles = Array.isArray(body.relatedTitles) ? body.relatedTitles : []
-  const hits = await collectEvidenceHits(text, plan, relatedUrls, relatedTitles)
+  const evidenceBefore =
+    verificationMode === "publication" ? referenceDate || publishedAt : null
+  const hits = await collectEvidenceHits(
+    text,
+    plan,
+    relatedUrls,
+    relatedTitles,
+    evidenceBefore,
+  )
   const sourceTexts = await gatherSourceTexts(hits, 3)
 
   const sourcesBlock = sourceTexts
@@ -520,17 +596,16 @@ export async function POST(req: NextRequest) {
     "- Не став CONTRADICTED лише через те, що з опорної дати вже минув час до «сьогодні».",
     "",
     "Правила чисел:",
-    "- truth_percent + fake_percent = 100.",
-    "- confidence від 0 до 1.",
-    "- Для SUPPORTED з підтвердженням у SOURCES став confidence ≥ 0.9 (типово 0.92–0.98). Не став 0.7–0.85 «про запас», якщо факт чітко підтверджений.",
-    "- Для CONTRADICTED з сильними доказами — confidence ≥ 0.88.",
-    "- Цитати до 220 символів. Не вигадуй URL і цитати: лише з SOURCES.",
+    "- truth_percent і fake_percent лише в діапазоні 0–100; їхня сума = 100.",
+    "- confidence від 0 до 1 — чесна оцінка моделі, БЕЗ штучного завищення.",
+    "- SUPPORTED / CONTRADICTED лише з evidence: url+quote, які реально є в SOURCES.",
+    "- Якщо цитати з SOURCES немає — став NOT_ENOUGH_INFO, навіть якщо здається правдоподібним.",
+    "- Цитати до 220 символів. Не вигадуй URL і цитати.",
     "- analysis: 2–3 речення українською.",
     "- overall.summary: 1–2 речення українською.",
     "- key_claims: до 4 SUPPORTED і до 3 CONTRADICTED, якщо такі є — БЕЗ дублікатів.",
-    "- Не дублюй ту саму думку коротшою й довшою версією (напр. «може зіграти» і «може зіграти після травми»).",
-    "- Якщо спростованих немає — не вигадуй CONTRADICTED. Якщо підтверджених мало — поверни стільки, скільки реально є.",
-    "- NOT_ENOUGH_INFO у key_claims не потрібні (їх можна опустити).",
+    "- Не дублюй ту саму думку коротшою й довшою версією.",
+    "- Якщо спростованих немає — не вигадуй CONTRADICTED.",
     "- claim — коротке твердження з тексту (1 речення). reason — 1 коротке речення чому так.",
   ].join("\n")
 
@@ -557,8 +632,6 @@ export async function POST(req: NextRequest) {
         { role: "system", content: system },
         { role: "user", content: user },
       ])
-      console.log(`[factcheck] ok ${llm.label} / ${llm.model}`)
-      console.log("[factcheck] raw (trunc):\n" + clip(res.raw, 1200))
       return buildFactCheckPayload(llm, res.parsed, sourceTexts)
     }),
   )
@@ -571,7 +644,6 @@ export async function POST(req: NextRequest) {
     else {
       const msg = s.reason instanceof Error ? s.reason.message : String(s.reason)
       errors.push(`${llms[i].label}: ${msg}`)
-      console.warn(`[factcheck] fail ${llms[i].label}:`, msg)
     }
   }
 
@@ -590,12 +662,26 @@ export async function POST(req: NextRequest) {
     factChecks[0]
   if (prefer?.overall?.summary || prefer?.analysis) {
     const summary = prefer.overall?.summary?.trim() || ""
-    const analysis = (prefer.analysis || summary).trim()
+    let analysis = (prefer.analysis || summary).trim()
+    const verdicts = Array.from(
+      new Set(
+        factChecks
+          .map((fc) => fc.overall?.verdict)
+          .filter(Boolean)
+          .map(String),
+      ),
+    )
+    if (verdicts.length > 1) {
+      const parts = factChecks
+        .map((fc) => `${fc.provider || "LLM"}: ${fc.overall?.verdict}`)
+        .filter(Boolean)
+      analysis = `${analysis}\n\nРозбіжності провайдерів: ${parts.join("; ")}.`
+    }
     consensus = {
       summary: summary || analysis.slice(0, 220),
       analysis: analysis || summary,
-      provider: "Фактчек",
-      model: "",
+      provider: String(prefer.provider || "Фактчек"),
+      model: String(prefer.model || ""),
     }
   }
 

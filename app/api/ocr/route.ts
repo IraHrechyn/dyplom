@@ -1,6 +1,7 @@
 import { spawn } from "child_process"
 import path from "path"
 import { NextRequest, NextResponse } from "next/server"
+import { pythonChildEnv } from "@/lib/python-env"
 
 export const runtime = "nodejs"
 
@@ -17,15 +18,15 @@ function runOcrStdinB64(command: string, prefix: string[], script: string, b64: 
     const child = spawn(command, [...prefix, script, "--json", "--stdin-b64"], {
       windowsHide: true,
       stdio: ["pipe", "pipe", "pipe"],
-      env: { ...process.env },
+      env: pythonChildEnv(),
     })
     let stdout = ""
     let stderr = ""
     child.stdout?.on("data", (c: Buffer) => {
-      stdout += c.toString()
+      stdout += c.toString("utf8")
     })
     child.stderr?.on("data", (c: Buffer) => {
-      stderr += c.toString()
+      stderr += c.toString("utf8")
     })
     child.on("error", reject)
     child.on("close", (code) => {

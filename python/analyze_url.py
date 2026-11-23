@@ -22,6 +22,37 @@ TFIDF_VECTORIZER_PATH = MODELS / "tfidf_vectorizer.joblib"
 if str(PY_DIR) not in sys.path:
     sys.path.insert(0, str(PY_DIR))
 
+_sklearn_model = None
+_tfidf_vectorizer = None
+_keras_model = None
+_keras_tokenizer = None
+_keras_maxlen: int | None = None
+
+
+def _load_sklearn():
+    global _sklearn_model, _tfidf_vectorizer
+    if _sklearn_model is None or _tfidf_vectorizer is None:
+        import joblib
+
+        _sklearn_model = joblib.load(SKLEARN_MODEL_PATH)
+        _tfidf_vectorizer = joblib.load(TFIDF_VECTORIZER_PATH)
+    return _sklearn_model, _tfidf_vectorizer
+
+
+def _load_keras():
+    global _keras_model, _keras_tokenizer, _keras_maxlen
+    if _keras_model is None or _keras_tokenizer is None:
+        os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+        from tensorflow import keras
+
+        _keras_model = keras.models.load_model(str(MODEL_PATH), compile=False)
+        with open(TOKENIZER_PATH, "rb") as f:
+            _keras_tokenizer = pickle.load(f)
+        if not hasattr(_keras_tokenizer, "texts_to_sequences"):
+            raise RuntimeError("Пошкоджений tokenizer.pkl")
+        _keras_maxlen = _infer_maxlen(_keras_model)
+    return _keras_model, _keras_tokenizer, int(_keras_maxlen or 500)
+
 def detect_text_language(text: str) -> str:
     cyr = len(re.findall(r"[А-Яа-яІіЇїЄєҐґ]", text or ""))
     lat = len(re.findall(r"[A-Za-z]", text or ""))
@@ -150,14 +181,22 @@ def _fragment_dict(sentence: str, p_fake: float) -> dict:
         "riskPercent": round(p * 100, 1),
     }
 
+UA_FAKE_CLASS_LABEL = 0
+UA_REAL_CLASS_LABEL = 1
+
 def _sklearn_fake_class_index(model) -> int:
-    classes = list(getattr(model, "classes_", [0, 1]))
+    classes = list(getattr(model, "classes_", [UA_FAKE_CLASS_LABEL, UA_REAL_CLASS_LABEL]))
     try:
-        wanted = int(os.environ.get("SKLEARN_FAKE_CLASS_INDEX", "0").strip() or "0")
+        wanted = int(
+            os.environ.get("SKLEARN_FAKE_CLASS_INDEX", str(UA_FAKE_CLASS_LABEL)).strip()
+            or str(UA_FAKE_CLASS_LABEL)
+        )
     except ValueError:
-        wanted = 0
+        wanted = UA_FAKE_CLASS_LABEL
     if wanted in classes:
         return classes.index(wanted)
+    if UA_FAKE_CLASS_LABEL in classes:
+        return classes.index(UA_FAKE_CLASS_LABEL)
     return 0
 
 def _predict_sklearn_p_fake(model, vectorizer, texts: list[str]) -> list[float]:
@@ -230,9 +269,6 @@ def _analyze_full_text(
 ) -> tuple[float, str, list[dict], list[dict], dict]:
     from news_article_extractor import NewsExtractionError
 
-    os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
-    import joblib
-
     lang = detect_text_language(text)
     excerpt = text[:400] + ("…" if len(text) > 400 else "")
     sents = _pick_sentences(text, max_sentences_scan, min_sentence_len)
@@ -240,11 +276,12 @@ def _analyze_full_text(
     if lang == "uk":
         if not SKLEARN_MODEL_PATH.is_file() or not TFIDF_VECTORIZER_PATH.is_file():
             raise NewsExtractionError("Не знайдено українську модель TF-IDF+LR")
-        sklearn_model = joblib.load(SKLEARN_MODEL_PATH)
-        vectorizer = joblib.load(TFIDF_VECTORIZER_PATH)
+        sklearn_model, vectorizer = _load_sklearn()
         p_fake = _predict_sklearn_p_fake(sklearn_model, vectorizer, [text])[0]
         p_batch = _predict_sklearn_p_fake(sklearn_model, vectorizer, sents) if sents else []
         reliable, questionable = _split_reliable_questionable(sents, p_batch, top_k)
+        classes = [int(c) for c in list(getattr(sklearn_model, "classes_", [0, 1]))]
+        fake_label = classes[_sklearn_fake_class_index(sklearn_model)]
         model_breakdown = {
             "language": "uk",
             "activeModel": "tfidf",
@@ -254,21 +291,19 @@ def _analyze_full_text(
             "kerasTruthPercentage": None,
             "sklearnWeight": 100.0,
             "kerasWeight": 0.0,
+            "labelMap": {
+                "fakeClass": fake_label,
+                "realClass": next((c for c in classes if c != fake_label), UA_REAL_CLASS_LABEL),
+                "convention": "ua_tfidf: 0=fake, 1=real",
+            },
         }
         return p_fake, excerpt, reliable, questionable, model_breakdown
 
-    from tensorflow import keras
     from tensorflow.keras.preprocessing.sequence import pad_sequences
 
     if not MODEL_PATH.is_file() or not TOKENIZER_PATH.is_file():
         raise NewsExtractionError("Не знайдено англійську модель LSTM/Keras")
-    model = keras.models.load_model(str(MODEL_PATH), compile=False)
-    with open(TOKENIZER_PATH, "rb") as f:
-        tokenizer = pickle.load(f)
-    if not hasattr(tokenizer, "texts_to_sequences"):
-        raise NewsExtractionError("Пошкоджений tokenizer.pkl")
-
-    maxlen = _infer_maxlen(model)
+    model, tokenizer, maxlen = _load_keras()
     seq_full = tokenizer.texts_to_sequences([text])
     pad_full = pad_sequences(seq_full, maxlen=maxlen, padding="pre", truncating="pre")
     p_fake = max(0.0, min(1.0, float(_predict_fake_probability(model, pad_full))))
@@ -288,6 +323,12 @@ def _analyze_full_text(
         "kerasTruthPercentage": round((1.0 - p_fake) * 100, 1),
         "sklearnWeight": 0.0,
         "kerasWeight": 100.0,
+        "labelMap": {
+            "output": "sigmoid",
+            "interpretedAs": "p_fake",
+            "architecture": "Bidirectional(LSTM(64))+Dense(32)",
+            "convention": "welfake_lstm CSV: 0=real, 1=fake; sigmoid ≈ P(fake); override via FAKE_NEWS_RAW_IS_P_TRUE=1",
+        },
     }
     return p_fake, excerpt, reliable, questionable, model_breakdown
 
@@ -379,7 +420,7 @@ def _append_related_reading(result: dict, text: str, req_timeout: int) -> None:
     try:
         extra = fetch_related_reading_payload(
             text,
-            timeout=float(min(max(req_timeout, 4), 6)),
+            timeout=float(min(max(req_timeout, 2), 3)),
         )
     except Exception:
         extra = {"relatedArticles": [], "readingSearchQuery": ""}
@@ -440,8 +481,8 @@ def analyze_raw_text(
         "modeDetail": mode_detail,
         "baseTruthPercentage": base_truth,
         "baseFakePercentage": base_fake,
-        "truthPercentage": base_truth,
-        "fakePercentage": base_fake,
+        "truthPercentage": adj_truth,
+        "fakePercentage": adj_fake,
         "adjustedTruthPercentage": adj_truth,
         "adjustedFakePercentage": adj_fake,
         "scoreNote": mode_note,
@@ -449,7 +490,7 @@ def analyze_raw_text(
         "reliableFragments": reliable_fr,
         "questionableFragments": questionable_fr,
         "trueParts": [
-            f"{mode_title}: загальна оцінка тексту — надійність ~{base_truth}% / ризик ~{base_fake}%.",
+            f"{mode_title}: загальна оцінка тексту — надійність ~{adj_truth}% / ризик ~{adj_fake}%.",
             caveat,
         ],
         "fakeParts": [
@@ -458,7 +499,7 @@ def analyze_raw_text(
         ],
         "sources": [],
     }
-    _append_related_reading(out, text, 12)
+    _append_related_reading(out, text, 3)
     return out
 
 def analyze_url(
@@ -522,8 +563,8 @@ def analyze_url(
         "modeDetail": mode_detail,
         "baseTruthPercentage": base_truth,
         "baseFakePercentage": base_fake,
-        "truthPercentage": base_truth,
-        "fakePercentage": base_fake,
+        "truthPercentage": adj_truth,
+        "fakePercentage": adj_fake,
         "adjustedTruthPercentage": adj_truth,
         "adjustedFakePercentage": adj_fake,
         "scoreNote": mode_note,
@@ -531,7 +572,7 @@ def analyze_url(
         "reliableFragments": reliable_fr,
         "questionableFragments": questionable_fr,
         "trueParts": [
-            f"{mode_title}: загальна оцінка тексту — надійність ~{base_truth}% / ризик ~{base_fake}%. {mode_detail}",
+            f"{mode_title}: загальна оцінка тексту — надійність ~{adj_truth}% / ризик ~{adj_fake}%. {mode_detail}",
             mode_note,
             caveat,
         ],
@@ -544,6 +585,44 @@ def analyze_url(
     _append_related_reading(out, text, timeout or 15)
     return out
 
+def _worker_loop() -> None:
+    if SKLEARN_MODEL_PATH.is_file() and TFIDF_VECTORIZER_PATH.is_file():
+        try:
+            _load_sklearn()
+        except Exception as e:
+            print(f"[worker] sklearn preload skipped: {e}", file=sys.stderr)
+    print(json.dumps({"ok": True, "ready": True}, ensure_ascii=False), flush=True)
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        req_id = None
+        try:
+            payload = json.loads(line)
+            if not isinstance(payload, dict):
+                raise ValueError("очікується JSON-об'єкт")
+            req_id = payload.get("id")
+            op = str(payload.get("op") or "").strip().lower()
+            vm = str(payload.get("verificationMode") or VERIFICATION_TODAY).strip().lower()
+            if vm not in (VERIFICATION_PUBLICATION, VERIFICATION_TODAY):
+                vm = VERIFICATION_TODAY
+            if op in ("text", "analyze_text", "raw"):
+                data = analyze_raw_text(str(payload.get("text") or ""), verification_mode=vm)
+            elif op in ("url", "analyze_url"):
+                timeout = int(payload.get("timeout") or 15)
+                data = analyze_url(str(payload.get("url") or ""), timeout=timeout, verification_mode=vm)
+            elif op == "ping":
+                data = {"pong": True}
+            else:
+                raise ValueError(f"невідома операція: {op!r}")
+            print(json.dumps({"id": req_id, "ok": True, "data": data}, ensure_ascii=False), flush=True)
+        except Exception as e:
+            print(
+                json.dumps({"id": req_id, "ok": False, "error": str(e)}, ensure_ascii=False),
+                flush=True,
+            )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Аналіз URL або вставленого тексту (stdin JSON)")
     parser.add_argument("url", nargs="?", default=None, help="Посилання на новину")
@@ -551,6 +630,11 @@ def main() -> None:
         "--stdin",
         action="store_true",
         help='JSON з stdin: {"text":"...","verificationMode":"today"|"publication"}',
+    )
+    parser.add_argument(
+        "--worker",
+        action="store_true",
+        help="Довгоживучий процес: JSON-рядки stdin → JSON-рядки stdout (моделі в кеші)",
     )
     parser.add_argument("--timeout", type=int, default=15)
     parser.add_argument(
@@ -561,6 +645,10 @@ def main() -> None:
     )
     parser.add_argument("--json", action="store_true", help="Лише JSON у stdout")
     args = parser.parse_args()
+
+    if args.worker:
+        _worker_loop()
+        return
 
     try:
         if args.stdin:

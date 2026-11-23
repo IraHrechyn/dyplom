@@ -2,6 +2,8 @@ import { execFile, spawn } from "child_process"
 import { promisify } from "util"
 import path from "path"
 import { NextRequest, NextResponse } from "next/server"
+import { pythonChildEnv } from "@/lib/python-env"
+import { analyzeViaWorker } from "@/lib/python-analyze-worker"
 
 const execFileAsync = promisify(execFile)
 
@@ -25,14 +27,15 @@ function runPythonWithStdin(
     const child = spawn(command, fullArgs, {
       windowsHide: true,
       stdio: ["pipe", "pipe", "pipe"],
+      env: pythonChildEnv(),
     })
     let stdout = ""
     let stderr = ""
     child.stdout?.on("data", (c: Buffer) => {
-      stdout += c.toString()
+      stdout += c.toString("utf8")
     })
     child.stderr?.on("data", (c: Buffer) => {
-      stderr += c.toString()
+      stderr += c.toString("utf8")
     })
     child.on("error", reject)
     child.on("close", (code) => {
@@ -83,7 +86,10 @@ export async function POST(request: NextRequest) {
   const rawText = typeof body.rawText === "string" ? body.rawText.trim() : ""
 
   if (url && rawText) {
-    return NextResponse.json({ error: "Передайте або посилання (url), або текст (rawText), не обидва" }, { status: 400 })
+    return NextResponse.json(
+      { error: "Передайте або посилання (url), або текст (rawText), не обидва" },
+      { status: 400 },
+    )
   }
   if (!url && !rawText) {
     return NextResponse.json({ error: "Потрібен параметр url або rawText" }, { status: 400 })
@@ -92,11 +98,32 @@ export async function POST(request: NextRequest) {
   const rawMode = (body.verificationMode ?? "publication").trim().toLowerCase()
   const verificationMode = MODES.includes(rawMode as (typeof MODES)[number]) ? rawMode : "publication"
 
-  const script = path.join(process.cwd(), "python", "analyze_url.py")
-  const attempts = pythonCommands()
-  const env = { ...process.env }
-
   try {
+    try {
+      const data = rawText
+        ? await analyzeViaWorker({
+            op: "text",
+            text: rawText,
+            verificationMode: "today",
+          })
+        : await analyzeViaWorker({
+            op: "url",
+            url,
+            verificationMode,
+            timeout: 15,
+          })
+      if (data?.error) {
+        return NextResponse.json({ error: String(data.error) }, { status: 422 })
+      }
+      return NextResponse.json(data)
+    } catch {
+      // fallback: one-shot Python process
+    }
+
+    const script = path.join(process.cwd(), "python", "analyze_url.py")
+    const attempts = pythonCommands()
+    const env = pythonChildEnv()
+
     let stdout: string
     if (rawText) {
       stdout = await runStdinAnalyze(script, { text: rawText, verificationMode: "today" }, attempts)
@@ -107,6 +134,7 @@ export async function POST(request: NextRequest) {
           maxBuffer: 50 * 1024 * 1024,
           timeout: 120_000,
           windowsHide: true,
+          encoding: "utf8",
           env,
         })
         stdout = out
@@ -121,6 +149,7 @@ export async function POST(request: NextRequest) {
               maxBuffer: 50 * 1024 * 1024,
               timeout: 120_000,
               windowsHide: true,
+              encoding: "utf8",
               env,
             })
             captured = out
@@ -145,71 +174,36 @@ export async function POST(request: NextRequest) {
 }
 
 function tryParseExecStdout(e: unknown): NextResponse | null {
-  const stdout =
-    e && typeof e === "object" && "stdout" in e
-      ? String((e as { stdout?: Buffer | string }).stdout ?? "")
-      : ""
-  if (!stdout.trim()) return null
-  try {
-    const data = JSON.parse(stdout.trim()) as { error?: string }
-    if (data.error) {
-      return NextResponse.json(data, { status: 502 })
-    }
-  } catch {
-    
+  const anyErr = e as { stdout?: string }
+  if (typeof anyErr?.stdout === "string" && anyErr.stdout.trim()) {
+    return parseStdout(anyErr.stdout)
   }
   return null
 }
 
 function parseStdout(stdout: string): NextResponse {
-  const line = stdout.trim()
-  if (!line) {
-    return NextResponse.json({ error: "Порожня відповідь від Python" }, { status: 502 })
+  const text = stdout.trim()
+  if (!text) {
+    return NextResponse.json({ error: "Порожня відповідь Python" }, { status: 500 })
   }
-  let data: {
-    error?: string
-    text?: string
-    images?: string[]
-    videos?: string[]
-    publishedAt?: string | null
-    inputKind?: string
-    verificationMode?: string
-    referenceDate?: string
-    modeTitle?: string
-    modeDetail?: string
-    baseTruthPercentage?: number
-    baseFakePercentage?: number
-    scoreNote?: string
-    truthPercentage?: number
-    fakePercentage?: number
-    modelBreakdown?: {
-      language?: string
-      activeModel?: string
-      sklearnFakePercentage?: number | null
-      sklearnTruthPercentage?: number | null
-      kerasFakePercentage?: number | null
-      kerasTruthPercentage?: number | null
-      sklearnWeight?: number
-      kerasWeight?: number
-    }
-    reliableFragments?: { text: string; trustPercent: number; riskPercent: number }[]
-    questionableFragments?: { text: string; trustPercent: number; riskPercent: number }[]
-    trueParts?: string[]
-    fakeParts?: string[]
-    sources?: string[]
-    relatedArticles?: { title: string; url: string; snippet?: string; publisher?: string }[]
-    readingSearchQuery?: string
-  }
+  let data: any
   try {
-    data = JSON.parse(line) as typeof data
+    data = JSON.parse(text)
   } catch {
-    return NextResponse.json(
-      { error: "Не вдалося розпарсити JSON від Python", raw: line.slice(0, 500) },
-      { status: 502 },
-    )
+    const start = text.indexOf("{")
+    const end = text.lastIndexOf("}")
+    if (start >= 0 && end > start) {
+      try {
+        data = JSON.parse(text.slice(start, end + 1))
+      } catch {
+        return NextResponse.json({ error: "Python повернув не JSON", raw: text.slice(0, 500) }, { status: 500 })
+      }
+    } else {
+      return NextResponse.json({ error: "Python повернув не JSON", raw: text.slice(0, 500) }, { status: 500 })
+    }
   }
-  if (data.error) {
-    return NextResponse.json(data, { status: 502 })
+  if (data?.error) {
+    return NextResponse.json({ error: String(data.error) }, { status: 422 })
   }
   return NextResponse.json(data)
 }

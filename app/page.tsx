@@ -335,11 +335,8 @@ export default function Home() {
         }
       }
 
-      console.log("[аналіз статті]", payload)
-
       if (!res.ok || payload.error) {
         setAnalyzeError(formatError(payload.error ?? res.statusText) || "Помилка аналізу")
-        console.error("[extract]", payload.error ?? res.statusText)
         return
       }
 
@@ -360,10 +357,7 @@ export default function Home() {
           factCheckError = fcOut.factCheckError
         } catch (e) {
           factCheckError = formatError(e)
-          console.warn("[factcheck] failed", e)
         }
-      } else if (factCheckError) {
-        console.warn("[factcheck]", factCheckError)
       }
 
       const TRUST = {
@@ -372,15 +366,17 @@ export default function Home() {
         style: 0.6,
       } as const
 
+      const clampPct = (n: number) => Math.max(0, Math.min(100, Number.isFinite(n) ? n : 0))
       const usable = factChecks.filter((fc) => {
         const o = fc?.overall
-        const hasSources = (fc?.sourcesUsed?.length ?? 0) > 0
         if (!o || typeof o.fakePercent !== "number") return false
-        if (fc?.plausibilityOnly && !hasSources && o.verdict === "NOT_ENOUGH_INFO") return false
+        if (o.verdict === "NOT_ENOUGH_INFO") return false
+        const hasSources = (fc?.sourcesUsed?.length ?? 0) > 0
+        if (fc?.plausibilityOnly && !hasSources) return false
         return true
       })
 
-      const ensembleFake = fake
+      const ensembleFake = clampPct(fake)
       const votes: { name: string; fake: number; weight: number }[] = []
       const mb = payload.modelBreakdown
       const styleWeight = TRUST.style
@@ -394,15 +390,14 @@ export default function Home() {
 
       for (const fc of usable) {
         const p = (fc.provider || "").toLowerCase()
-        let weight = p.includes("gemini")
+        const weight = p.includes("gemini")
           ? TRUST.gemini
           : p.includes("openrouter")
             ? TRUST.openrouter
             : 0.35
-        if (fc.overall?.verdict === "NOT_ENOUGH_INFO") weight *= 0.7
         votes.push({
           name: fc.provider || "LLM",
-          fake: Number(fc.overall!.fakePercent),
+          fake: clampPct(Number(fc.overall!.fakePercent)),
           weight,
         })
       }
@@ -414,12 +409,13 @@ export default function Home() {
 
       if (votes.length) {
         const sumW = votes.reduce((s, v) => s + v.weight, 0) || 1
-        combinedFake =
-          Math.round((votes.reduce((s, v) => s + v.fake * v.weight, 0) / sumW) * 10) / 10
+        combinedFake = clampPct(
+          Math.round((votes.reduce((s, v) => s + v.fake * v.weight, 0) / sumW) * 10) / 10,
+        )
         combinedNote = usable.length
           ? "Фінальна оцінка за результатами повної перевірки."
           : factChecks.length
-            ? "Фактчек виконано; на діаграмі зараз переважно стильова оцінка."
+            ? "Фактчек виконано; на діаграмі стильова оцінка (брак перевірених доказів не змінює ризик)."
             : combinedNote
       }
 
@@ -463,7 +459,6 @@ export default function Home() {
       })
     } catch (e) {
       setAnalyzeError(formatError(e) || "Помилка запиту")
-      console.error("[extract] fetch failed", e)
     } finally {
       setIsLoading(false)
     }

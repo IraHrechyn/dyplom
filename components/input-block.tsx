@@ -169,7 +169,7 @@ export default function InputBlock({
                   <span className="font-semibold block">На момент публікації</span>
                   <span className="text-neutral-500 text-xs">
                     Дивимось на новину так, ніби ми в день її виходу (стара стаття не
-                    «провинює» лише тому, що світ уже змінився)
+                    стає неправдивою лише тому, що обставини змінилися)
                   </span>
                 </span>
               </label>

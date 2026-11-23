@@ -26,11 +26,12 @@ load_dotenv(ROOT / ".env")
 from analyze_url import (
     VERIFICATION_PUBLICATION,
     VERIFICATION_TODAY,
+    _load_sklearn,
     analyze_raw_text,
     analyze_url,
 )
 from chart_image import render_conclusion_chart
-from factcheck_client import enrich_like_web
+from factcheck_client import enrich_like_web, factcheck_api_url
 from news_article_extractor import NewsExtractionError
 from ocr_screenshot import OcrError, extract_text_from_image
 
@@ -38,6 +39,8 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     level=logging.INFO,
 )
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 log = logging.getLogger("telegram_bot")
 
 URL_RE = re.compile(r"^https?://\S+$", re.IGNORECASE)
@@ -70,7 +73,20 @@ def _format_facts(title: str, items: list[dict], *, empty_hint: str) -> str:
         conf_pct = int(round(float(conf) * 100)) if conf is not None else None
         claim = _clip(str(fr.get("claim") or ""), 220)
         meta = f" ({conf_pct}%)" if conf_pct is not None else ""
+        provider = str(fr.get("provider") or "").strip()
+        if provider:
+            meta = f"{meta} [{provider}]" if meta else f" [{provider}]"
         lines.append(f"{i}. {_esc(claim)}{_esc(meta)}")
+        citations = fr.get("citations") if isinstance(fr.get("citations"), list) else []
+        for cit in citations[:2]:
+            if not isinstance(cit, dict):
+                continue
+            url = str(cit.get("url") or "").strip()
+            quote = str(cit.get("quote") or "").strip()
+            if url:
+                lines.append(f"   🔗 {_esc(_clip(url, 120))}")
+            if quote:
+                lines.append(f"   <i>«{_esc(_clip(quote, 160))}»</i>")
         note = (fr.get("note") or "").strip()
         if note:
             lines.append(f"   <i>{_esc(_clip(note, 180))}</i>")
@@ -112,6 +128,12 @@ def format_result(result: dict, *, input_kind: str, ocr_preview: str | None = No
     if summary or analysis:
         parts.append("")
         parts.append("<b>Висновок фактчеку</b>")
+        if isinstance(consensus, dict):
+            src = " / ".join(
+                x for x in [str(consensus.get("provider") or "").strip(), str(consensus.get("model") or "").strip()] if x
+            )
+            if src:
+                parts.append(f"<i>Джерело: {_esc(src)}</i>")
         if summary:
             parts.append(_esc(summary))
         if analysis and analysis != summary:
@@ -149,8 +171,32 @@ async def _reply_analysis(
         await status.edit_text(f"Помилка: {result['error']}")
         return
 
+    mb = result.get("modelBreakdown") or {}
+    log.info(
+        "[стиль] lang=%s model=%s risk=%s%% truth=%s%%",
+        mb.get("language"),
+        mb.get("activeModel"),
+        result.get("fakePercentage"),
+        result.get("truthPercentage"),
+    )
     await status.edit_text("⏳ Стиль оцінено. Запускаю фактчек…")
     enriched = await asyncio.to_thread(enrich_like_web, result)
+    if enriched.get("factCheckError"):
+        log.warning("[фактчек] %s", enriched.get("factCheckError"))
+    else:
+        log.info(
+            "[фактчек] providers=%s claims_true=%s claims_false=%s",
+            [fc.get("provider") for fc in (enriched.get("factChecks") or [])],
+            len(enriched.get("trueFacts") or []),
+            len(enriched.get("falseFacts") or []),
+        )
+    combined = enriched.get("combined") or {}
+    log.info(
+        "[soft vote] risk=%s%% truth=%s%% note=%s",
+        combined.get("combinedFakePercent", enriched.get("fakePercentage")),
+        combined.get("combinedTruthPercent", enriched.get("truthPercentage")),
+        combined.get("note"),
+    )
 
     truth = float(enriched.get("truthPercentage") or 0)
     risk = float(enriched.get("fakePercentage") or 0)
@@ -360,6 +406,14 @@ def main() -> None:
             "Додайте його у файл .env.local у корені проєкту, наприклад:\n"
             "TELEGRAM_BOT_TOKEN=123456:ABC..."
         )
+
+    try:
+        _load_sklearn()
+        log.info("UA TF-IDF модель прогріто в пам'яті")
+    except Exception as e:
+        log.warning("Не вдалося прогріти UA-модель заздалегідь: %s", e)
+
+    log.info("FACTCHECK_API_URL=%s", factcheck_api_url())
 
     app = Application.builder().token(token).build()
     app.add_handler(CommandHandler("start", cmd_start))

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import logging
 import os
 import re
 from typing import Any
 
 import requests
+
+log = logging.getLogger("factcheck_client")
 
 TRUST = {
     "openrouter": 0.20,
@@ -106,6 +109,10 @@ def soft_vote_combined(style_result: dict[str, Any], fact_checks: list[dict[str,
     else:
         votes.append(("стиль", ensemble_fake, style_w))
 
+    def _clamp_pct(n: float) -> float:
+        return max(0.0, min(100.0, float(n)))
+
+    ensemble_fake = _clamp_pct(ensemble_fake)
     usable = []
     for fc in fact_checks:
         o = fc.get("overall") or {}
@@ -114,8 +121,10 @@ def soft_vote_combined(style_result: dict[str, Any], fact_checks: list[dict[str,
         fake = o.get("fakePercent")
         if not isinstance(fake, (int, float)):
             continue
+        if o.get("verdict") == "NOT_ENOUGH_INFO":
+            continue
         has_sources = bool(fc.get("sourcesUsed"))
-        if fc.get("plausibilityOnly") and not has_sources and o.get("verdict") == "NOT_ENOUGH_INFO":
+        if fc.get("plausibilityOnly") and not has_sources:
             continue
         usable.append(fc)
 
@@ -127,9 +136,13 @@ def soft_vote_combined(style_result: dict[str, Any], fact_checks: list[dict[str,
             w = TRUST["openrouter"]
         else:
             w = 0.35
-        if (fc.get("overall") or {}).get("verdict") == "NOT_ENOUGH_INFO":
-            w *= 0.7
-        votes.append((str(fc.get("provider") or "LLM"), float(fc["overall"]["fakePercent"]), w))
+        votes.append(
+            (
+                str(fc.get("provider") or "LLM"),
+                _clamp_pct(float(fc["overall"]["fakePercent"])),
+                w,
+            )
+        )
 
     if not votes:
         return {
@@ -139,11 +152,33 @@ def soft_vote_combined(style_result: dict[str, Any], fact_checks: list[dict[str,
         }
 
     sum_w = sum(w for _, _, w in votes) or 1.0
-    combined_fake = round(sum(fake * w for _, fake, w in votes) / sum_w, 1)
+    combined_fake = _clamp_pct(round(sum(fake * w for _, fake, w in votes) / sum_w, 1))
+    log.info(
+        "[soft vote] моделі: %s",
+        [
+            {
+                "model": name,
+                "riskPercent": fake,
+                "truthPercent": round(100.0 - fake, 1),
+                "weight": w,
+                "weightShare": f"{round((w / sum_w) * 1000) / 10}%",
+            }
+            for name, fake, w in votes
+        ],
+    )
+    log.info(
+        "[soft vote] підсумок: %s",
+        {
+            "riskPercent": combined_fake,
+            "truthPercent": round(100.0 - combined_fake, 1),
+            "activeStyleModel": (mb.get("activeModel") if isinstance(mb, dict) else None),
+            "language": (mb.get("language") if isinstance(mb, dict) else None),
+        },
+    )
     if usable:
         note = "Фінальна оцінка за результатами повної перевірки."
     elif fact_checks:
-        note = "Фактчек виконано; на діаграмі зараз переважно стильова оцінка."
+        note = "Фактчек виконано; на діаграмі стильова оцінка (брак перевірених доказів не змінює ризик)."
     else:
         note = "Фінальна оцінка за стилем тексту."
     return {
@@ -183,6 +218,7 @@ def merge_claims(
     contradicted: list[dict[str, Any]] = []
 
     for fc in fact_checks:
+        provider = str(fc.get("provider") or "").strip() or None
         for c in fc.get("claims") or []:
             if not isinstance(c, dict):
                 continue
@@ -190,28 +226,45 @@ def merge_claims(
             if not claim:
                 continue
             verdict = c.get("verdict")
-            conf = float(c.get("confidence") or 0)
-            if verdict == "SUPPORTED":
-                conf = max(conf, 0.9 if c.get("citations") else 0.85)
-            elif verdict == "CONTRADICTED":
-                conf = max(conf, 0.88 if c.get("citations") else 0.85)
-            else:
+            citations = c.get("citations") if isinstance(c.get("citations"), list) else []
+            verified = [
+                {
+                    "url": str(x.get("url") or "").strip(),
+                    "quote": str(x.get("quote") or "").strip(),
+                }
+                for x in citations
+                if isinstance(x, dict) and str(x.get("url") or "").strip() and str(x.get("quote") or "").strip()
+            ]
+            if verdict not in ("SUPPORTED", "CONTRADICTED") or not verified:
                 continue
+            conf = max(0.0, min(1.0, float(c.get("confidence") or 0)))
             item = {
                 "claim": claim,
-                "confidence": min(1.0, conf),
+                "confidence": conf,
                 "note": str(c.get("note") or "").strip() or None,
+                "citations": verified,
+                "provider": provider,
             }
             if verdict == "SUPPORTED":
                 supported.append(item)
             else:
                 contradicted.append(item)
 
-    supported_ok = [c for c in _dedupe_claims(supported) if float(c["confidence"]) >= 0.85]
-    contradicted_ok = [c for c in _dedupe_claims(contradicted) if float(c["confidence"]) >= 0.85]
+    supported_d = _dedupe_claims(supported)
+    contradicted_d = _dedupe_claims(contradicted)
+    supported_final: list[dict[str, Any]] = []
+    for s in supported_d:
+        if any(_claims_near_duplicate(str(s.get("claim") or ""), str(x.get("claim") or "")) for x in contradicted_d):
+            continue
+        supported_final.append(s)
+    contradicted_final: list[dict[str, Any]] = []
+    for c in contradicted_d:
+        if any(_claims_near_duplicate(str(c.get("claim") or ""), str(x.get("claim") or "")) for x in supported_d):
+            continue
+        contradicted_final.append(c)
     return {
-        "supported": (supported_ok or _dedupe_claims(supported))[:true_limit],
-        "contradicted": contradicted_ok[:false_limit],
+        "supported": supported_final[:true_limit],
+        "contradicted": contradicted_final[:false_limit],
     }
 
 def enrich_like_web(style_result: dict[str, Any]) -> dict[str, Any]:
@@ -223,8 +276,9 @@ def enrich_like_web(style_result: dict[str, Any]) -> dict[str, Any]:
         reference_date=(
             str(style_result["referenceDate"]).strip() if style_result.get("referenceDate") else None
         ),
-        timeout=90.0,
+        timeout=180.0,
         fast=True,
+        providers=["openrouter", "gemini"],
     )
     checks = fc.get("factChecks") or []
     combined = soft_vote_combined(style_result, checks)

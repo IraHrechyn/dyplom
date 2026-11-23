@@ -18,6 +18,8 @@ type FactClaim = {
   verdict: "SUPPORTED" | "CONTRADICTED" | "NOT_ENOUGH_INFO"
   confidence: number
   note?: string
+  citations?: { sourceIndex: number; url: string; quote: string }[]
+  provider?: string
 }
 
 function ClaimCard({ item, kind }: { item: FactClaim; kind: "true" | "false" }) {
@@ -29,6 +31,7 @@ function ClaimCard({ item, kind }: { item: FactClaim; kind: "true" | "false" }) 
   const badgeColor = kind === "true" ? "text-emerald-400/90" : "text-red-400"
   const bar = kind === "true" ? "bg-emerald-500" : "bg-red-600"
   const confPct = Math.round(Math.max(0, Math.min(1, item.confidence)) * 100)
+  const citations = (item.citations ?? []).filter((c) => c.url && c.quote)
 
   return (
     <div className={`rounded-xl border p-5 text-left h-full flex flex-col ${shell}`}>
@@ -37,6 +40,9 @@ function ClaimCard({ item, kind }: { item: FactClaim; kind: "true" | "false" }) 
         <span className="text-neutral-500 text-xs">
           впевненість: <span className="text-white font-semibold">{confPct}%</span>
         </span>
+        {item.provider && (
+          <span className="text-neutral-600 text-xs">{item.provider}</span>
+        )}
       </div>
       <div className="h-1.5 w-full rounded-full bg-black/60 overflow-hidden mb-3">
         <div
@@ -45,6 +51,23 @@ function ClaimCard({ item, kind }: { item: FactClaim; kind: "true" | "false" }) 
         />
       </div>
       <p className="text-neutral-100 text-sm leading-relaxed font-medium">{item.claim}</p>
+      {citations.length > 0 && (
+        <div className="mt-3 space-y-2 border-t border-neutral-800/80 pt-3">
+          {citations.slice(0, 2).map((c, i) => (
+            <div key={`${c.url}-${i}`} className="text-xs text-neutral-400 leading-relaxed">
+              <a
+                href={c.url}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-red-400/90 hover:text-red-300 break-all"
+              >
+                {c.url.replace(/^https?:\/\//, "").slice(0, 72)}
+              </a>
+              <p className="mt-1 text-neutral-500 italic">«{c.quote}»</p>
+            </div>
+          ))}
+        </div>
+      )}
       {item.note && (
         <p className="mt-3 text-xs text-neutral-500 leading-relaxed border-t border-neutral-800/80 pt-3">
           {item.note}
@@ -87,7 +110,9 @@ function dedupeClaims(items: FactClaim[]): FactClaim[] {
   return out
 }
 
-function mergeFactClaims(factChecks: { claims?: FactClaim[] }[]): {
+function mergeFactClaims(
+  factChecks: { claims?: FactClaim[]; provider?: string }[],
+): {
   supported: FactClaim[]
   contradicted: FactClaim[]
 } {
@@ -97,15 +122,24 @@ function mergeFactClaims(factChecks: { claims?: FactClaim[] }[]): {
   for (const fc of factChecks) {
     for (const c of fc.claims ?? []) {
       if (!c.claim.trim()) continue
-      if (c.verdict === "SUPPORTED") supported.push(c)
-      else if (c.verdict === "CONTRADICTED") contradicted.push(c)
+      const citations = (c.citations ?? []).filter((x) => x.url && x.quote)
+      if (!citations.length) continue
+      const item = { ...c, citations, provider: c.provider || fc.provider }
+      if (c.verdict === "SUPPORTED") supported.push(item)
+      else if (c.verdict === "CONTRADICTED") contradicted.push(item)
     }
   }
 
-  const supportedOk = dedupeClaims(supported).filter((c) => c.confidence >= 0.85).slice(0, 6)
-  const contradictedOk = dedupeClaims(contradicted).filter((c) => c.confidence >= 0.85).slice(0, 6)
+  const supportedD = dedupeClaims(supported)
+  const contradictedD = dedupeClaims(contradicted)
+  const supportedOk = supportedD
+    .filter((s) => !contradictedD.some((x) => claimsNearDuplicate(s.claim, x.claim)))
+    .slice(0, 6)
+  const contradictedOk = contradictedD
+    .filter((c) => !supportedD.some((x) => claimsNearDuplicate(c.claim, x.claim)))
+    .slice(0, 6)
   return {
-    supported: supportedOk.length ? supportedOk : dedupeClaims(supported).slice(0, 4),
+    supported: supportedOk,
     contradicted: contradictedOk,
   }
 }
@@ -321,6 +355,16 @@ export default function ResultsSection({ result }: ResultsSectionProps) {
           <div className="mb-12 bg-gradient-to-br from-neutral-900 to-black p-6 rounded-lg border border-neutral-700">
             <h4 className="text-lg font-semibold text-white mb-2">Висновок фактчеку</h4>
             <div className="rounded-lg border border-neutral-800 bg-black/40 px-4 py-3">
+              {(result.factCheckConsensus.provider || result.factCheckConsensus.model) && (
+                <p className="text-xs text-neutral-500 mb-2">
+                  Джерело висновку:{" "}
+                  <span className="text-neutral-300">
+                    {[result.factCheckConsensus.provider, result.factCheckConsensus.model]
+                      .filter(Boolean)
+                      .join(" / ")}
+                  </span>
+                </p>
+              )}
               <p className="text-sm text-neutral-300">
                 <span className="text-red-400 font-semibold">Висновок:</span>{" "}
                 {result.factCheckConsensus.summary}

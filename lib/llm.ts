@@ -121,27 +121,52 @@ export function resolveProviderConfig(provider: LlmProvider): LlmConfig | { erro
 }
 
 function tryParseJsonFromText(raw: string): any | null {
-  const s = (raw ?? "").trim()
+  let s = (raw ?? "").trim()
   if (!s) return null
-  try {
-    return JSON.parse(s)
-  } catch {
-    const startObj = s.indexOf("{")
-    const startArr = s.indexOf("[")
-    const start =
-      startObj === -1 ? startArr : startArr === -1 ? startObj : Math.min(startObj, startArr)
-    if (start === -1) return null
+  s = s
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/\s*```$/i, "")
+    .trim()
+  const attempts = [s]
+  const startObj = s.indexOf("{")
+  const startArr = s.indexOf("[")
+  const start =
+    startObj === -1 ? startArr : startArr === -1 ? startObj : Math.min(startObj, startArr)
+  if (start > 0) attempts.push(s.slice(start))
+  if (start >= 0) {
     const tail = s.slice(start)
     const endObj = tail.lastIndexOf("}")
     const endArr = tail.lastIndexOf("]")
     const end = Math.max(endObj, endArr)
-    if (end <= 0) return null
+    if (end > 0) attempts.push(tail.slice(0, end + 1))
+  }
+  for (const chunk of attempts) {
     try {
-      return JSON.parse(tail.slice(0, end + 1))
+      return JSON.parse(chunk)
     } catch {
-      return null
+      try {
+        return JSON.parse(chunk.replace(/,\s*([}\]])/g, "$1"))
+      } catch {
+        /* try next */
+      }
     }
   }
+  return null
+}
+
+function extractMessageContent(data: any): string {
+  const msg = data?.choices?.[0]?.message
+  if (!msg) return ""
+  const content = msg.content
+  if (typeof content === "string") return content
+  if (Array.isArray(content)) {
+    return content
+      .map((p: any) => (typeof p === "string" ? p : String(p?.text ?? p?.content ?? "")))
+      .join("\n")
+  }
+  if (typeof msg.reasoning === "string") return msg.reasoning
+  if (msg.parsed && typeof msg.parsed === "object") return JSON.stringify(msg.parsed)
+  return ""
 }
 
 async function openaiCompatibleJson(
@@ -151,39 +176,51 @@ async function openaiCompatibleJson(
   messages: LlmMessage[],
   extraHeaders?: Record<string, string>,
 ): Promise<{ parsed: any; raw: string }> {
-  const response = await fetch(`${baseUrl.replace(/\/$/, "")}/chat/completions`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-      ...extraHeaders,
-    },
-    body: JSON.stringify({
+  const endpoint = `${baseUrl.replace(/\/$/, "")}/chat/completions`
+  const runOnce = async (withJsonFormat: boolean) => {
+    const body: Record<string, unknown> = {
       model,
       messages,
       temperature: 0.1,
-      max_tokens: 2048,
-      response_format: { type: "json_object" },
-    }),
-    signal: AbortSignal.timeout(45_000),
-  })
-
-  const data = (await response.json()) as any
-  if (!response.ok) {
-    const err = data?.error ?? data
-    const msg =
-      typeof err === "string"
-        ? err
-        : typeof err?.message === "string"
-          ? err.message
-          : JSON.stringify(err)
-    throw new Error(msg || `LLM error ${response.status}`)
+      max_tokens: 3000,
+    }
+    if (withJsonFormat) body.response_format = { type: "json_object" }
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+        ...extraHeaders,
+      },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(75_000),
+    })
+    const data = (await response.json()) as any
+    if (!response.ok) {
+      const err = data?.error ?? data
+      const msg =
+        typeof err === "string"
+          ? err
+          : typeof err?.message === "string"
+            ? err.message
+            : JSON.stringify(err)
+      throw new Error(msg || `LLM error ${response.status}`)
+    }
+    const raw = extractMessageContent(data)
+    const parsed = tryParseJsonFromText(raw)
+    if (!parsed) throw new Error("LLM returned non-JSON")
+    return { parsed, raw }
   }
 
-  const raw = String(data.choices?.[0]?.message?.content ?? "")
-  const parsed = tryParseJsonFromText(raw)
-  if (!parsed) throw new Error("LLM returned non-JSON")
-  return { parsed, raw }
+  try {
+    return await runOnce(true)
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e)
+    if (/non-JSON|response_format|json_object|invalid/i.test(msg)) {
+      return await runOnce(false)
+    }
+    throw e
+  }
 }
 
 async function anthropicJson(
@@ -254,11 +291,11 @@ async function geminiJsonOnce(
       contents,
       generationConfig: {
         temperature: 0.1,
-        maxOutputTokens: 2048,
+        maxOutputTokens: 3000,
         responseMimeType: "application/json",
       },
     }),
-    signal: AbortSignal.timeout(55_000),
+    signal: AbortSignal.timeout(60_000),
   })
 
   const data = (await response.json()) as any
@@ -303,11 +340,11 @@ async function geminiJson(
 
   const fallbacks = [
     model,
-    "gemini-flash-lite-latest",
     "gemini-2.5-flash-lite",
+    "gemini-flash-lite-latest",
+    "gemini-2.0-flash",
     "gemini-2.0-flash-lite",
     "gemini-flash-latest",
-    "gemini-3.5-flash",
   ]
   const tried = new Set<string>()
   let lastErr: unknown
@@ -321,8 +358,14 @@ async function geminiJson(
       lastErr = e
       const status = (e as { status?: number })?.status
       const msg = e instanceof Error ? e.message : String(e)
-      
-      if (status === 503 || status === 404 || /high demand|UNAVAILABLE|NOT_FOUND|no longer available/i.test(msg)) {
+      if (
+        status === 503 ||
+        status === 404 ||
+        status === 429 ||
+        /timeout|aborted|high demand|UNAVAILABLE|NOT_FOUND|no longer available|quota|RESOURCE_EXHAUSTED/i.test(
+          msg,
+        )
+      ) {
         continue
       }
       throw e
