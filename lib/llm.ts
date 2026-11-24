@@ -147,7 +147,6 @@ function tryParseJsonFromText(raw: string): any | null {
       try {
         return JSON.parse(chunk.replace(/,\s*([}\]])/g, "$1"))
       } catch {
-        /* try next */
       }
     }
   }

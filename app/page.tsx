@@ -56,7 +56,12 @@ export default function Home() {
         claim: string
         verdict: "SUPPORTED" | "CONTRADICTED" | "NOT_ENOUGH_INFO"
         confidence: number
-        citations: { sourceIndex: number; url: string; quote: string }[]
+        citations: {
+          sourceIndex: number
+          url: string
+          quote: string
+          verificationScope?: "search_snippet" | "full_page"
+        }[]
         note?: string
       }[]
       sourcesUsed: { url: string; title?: string }[]
@@ -79,7 +84,12 @@ export default function Home() {
         claim: string
         verdict: "SUPPORTED" | "CONTRADICTED" | "NOT_ENOUGH_INFO"
         confidence: number
-        citations: { sourceIndex: number; url: string; quote: string }[]
+        citations: {
+          sourceIndex: number
+          url: string
+          quote: string
+          verificationScope?: "search_snippet" | "full_page"
+        }[]
         note?: string
       }[]
       sourcesUsed: { url: string; title?: string }[]
@@ -172,7 +182,12 @@ export default function Home() {
           claim: string
           verdict: "SUPPORTED" | "CONTRADICTED" | "NOT_ENOUGH_INFO"
           confidence: number
-          citations: { sourceIndex: number; url: string; quote: string }[]
+          citations: {
+          sourceIndex: number
+          url: string
+          quote: string
+          verificationScope?: "search_snippet" | "full_page"
+        }[]
           note?: string
         }[]
         sourcesUsed: { url: string; title?: string }[]
@@ -366,17 +381,25 @@ export default function Home() {
         style: 0.6,
       } as const
 
-      const clampPct = (n: number) => Math.max(0, Math.min(100, Number.isFinite(n) ? n : 0))
-      const usable = factChecks.filter((fc) => {
-        const o = fc?.overall
-        if (!o || typeof o.fakePercent !== "number") return false
-        if (o.verdict === "NOT_ENOUGH_INFO") return false
-        const hasSources = (fc?.sourcesUsed?.length ?? 0) > 0
-        if (fc?.plausibilityOnly && !hasSources) return false
-        return true
-      })
+      const inRangePct = (n: unknown): n is number =>
+        typeof n === "number" && Number.isFinite(n) && n >= 0 && n <= 100
 
-      const ensembleFake = clampPct(fake)
+      const factcheckHasEvidence = (fc: (typeof factChecks)[number]) => {
+        const o = fc?.overall
+        if (!o || !inRangePct(o.fakePercent) || !inRangePct(o.truthPercent)) return false
+        if (o.verdict === "NOT_ENOUGH_INFO") return false
+        if (fc?.plausibilityOnly) return false
+        if (!(fc?.sourcesUsed?.length > 0)) return false
+        return (fc.claims ?? []).some(
+          (c) =>
+            (c.verdict === "SUPPORTED" || c.verdict === "CONTRADICTED") &&
+            (c.citations?.length ?? 0) > 0,
+        )
+      }
+
+      const usable = factChecks.filter(factcheckHasEvidence)
+
+      const ensembleFake = inRangePct(fake) ? fake : 50
       const votes: { name: string; fake: number; weight: number }[] = []
       const mb = payload.modelBreakdown
       const styleWeight = TRUST.style
@@ -397,7 +420,7 @@ export default function Home() {
             : 0.35
         votes.push({
           name: fc.provider || "LLM",
-          fake: clampPct(Number(fc.overall!.fakePercent)),
+          fake: Number(fc.overall!.fakePercent),
           weight,
         })
       }
@@ -409,9 +432,8 @@ export default function Home() {
 
       if (votes.length) {
         const sumW = votes.reduce((s, v) => s + v.weight, 0) || 1
-        combinedFake = clampPct(
-          Math.round((votes.reduce((s, v) => s + v.fake * v.weight, 0) / sumW) * 10) / 10,
-        )
+        const raw = Math.round((votes.reduce((s, v) => s + v.fake * v.weight, 0) / sumW) * 10) / 10
+        combinedFake = inRangePct(raw) ? raw : ensembleFake
         combinedNote = usable.length
           ? "Фінальна оцінка за результатами повної перевірки."
           : factChecks.length

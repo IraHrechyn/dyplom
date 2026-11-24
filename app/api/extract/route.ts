@@ -117,7 +117,6 @@ export async function POST(request: NextRequest) {
       }
       return NextResponse.json(data)
     } catch {
-      // fallback: one-shot Python process
     }
 
     const script = path.join(process.cwd(), "python", "analyze_url.py")

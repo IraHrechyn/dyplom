@@ -5,7 +5,7 @@
 ## Вимоги
 
 - Node.js **>= 20.9**
-- Python **3.10+**
+- Python **3.11+** (вимога `scikit-learn==1.8.0`)
 - ключі API у `.env.local` (див. `.env.example`)
 
 ## Встановлення
@@ -71,6 +71,6 @@ python python/train_lstm_welfake.py
 
 ## Примітки
 
-- Node.js ≥ 20.9; на Windows Python-процеси запускаються з `PYTHONUTF8=1`.
+- Node.js ≥ 20.9; Python ≥ 3.11; на Windows Python-процеси запускаються з `PYTHONUTF8=1`.
 - Завантаження URL блокує localhost / приватні IP та обмежує редиректи.
-- `scikit-learn==1.8.0` зафіксовано під наявні `.joblib`.
+- `scikit-learn==1.8.0` зафіксовано під наявні `.joblib` (тому мінімум Python 3.11).

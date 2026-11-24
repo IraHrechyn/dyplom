@@ -18,6 +18,7 @@ __pycache__/
 .idea/
 /data/*
 !/data/README.md
+!/data/*_run_report.md
 *.csv
 _docx_edit*/
 *.bak*

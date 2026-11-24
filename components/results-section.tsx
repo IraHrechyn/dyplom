@@ -13,23 +13,81 @@ type Fragment = {
   riskPercent: number
 }
 
-type FactClaim = {
-  claim: string
+type ClaimVerdict = "SUPPORTED" | "CONTRADICTED" | "NOT_ENOUGH_INFO" | "DISPUTED"
+
+type ClaimSideVerdict = {
+  provider?: string
   verdict: "SUPPORTED" | "CONTRADICTED" | "NOT_ENOUGH_INFO"
   confidence: number
   note?: string
-  citations?: { sourceIndex: number; url: string; quote: string }[]
-  provider?: string
 }
 
-function ClaimCard({ item, kind }: { item: FactClaim; kind: "true" | "false" }) {
+type FactClaim = {
+  claim: string
+  verdict: ClaimVerdict
+  confidence: number
+  note?: string
+  citations?: {
+    sourceIndex: number
+    url: string
+    quote: string
+    verificationScope?: "search_snippet" | "full_page"
+  }[]
+  provider?: string
+  sideVerdicts?: ClaimSideVerdict[]
+}
+
+function verificationScopeLabel(scope?: "search_snippet" | "full_page"): string | null {
+  if (scope === "search_snippet") return "звірка з пошуковим уривком"
+  if (scope === "full_page") return "звірка з повним текстом джерела"
+  return null
+}
+
+function sideVerdictLabel(v: ClaimSideVerdict["verdict"]): string {
+  if (v === "SUPPORTED") return "підтверджено"
+  if (v === "CONTRADICTED") return "спростовано"
+  return "недостатньо даних"
+}
+
+function ClaimCard({
+  item,
+  kind,
+}: {
+  item: FactClaim
+  kind: "true" | "false" | "disputed" | "insufficient"
+}) {
   const shell =
     kind === "true"
       ? "border-emerald-800/50 bg-emerald-950/20"
-      : "border-red-800/50 bg-red-950/25"
-  const badge = kind === "true" ? "Підтверджено" : "Спростовано"
-  const badgeColor = kind === "true" ? "text-emerald-400/90" : "text-red-400"
-  const bar = kind === "true" ? "bg-emerald-500" : "bg-red-600"
+      : kind === "false"
+        ? "border-red-800/50 bg-red-950/25"
+        : kind === "disputed"
+          ? "border-amber-800/50 bg-amber-950/20"
+          : "border-neutral-700/60 bg-neutral-900/40"
+  const badge =
+    kind === "true"
+      ? "Підтверджено"
+      : kind === "false"
+        ? "Спростовано"
+        : kind === "disputed"
+          ? "Суперечливе"
+          : "Недостатньо даних"
+  const badgeColor =
+    kind === "true"
+      ? "text-emerald-400/90"
+      : kind === "false"
+        ? "text-red-400"
+        : kind === "disputed"
+          ? "text-amber-400/90"
+          : "text-neutral-400"
+  const bar =
+    kind === "true"
+      ? "bg-emerald-500"
+      : kind === "false"
+        ? "bg-red-600"
+        : kind === "disputed"
+          ? "bg-amber-500"
+          : "bg-neutral-500"
   const confPct = Math.round(Math.max(0, Math.min(1, item.confidence)) * 100)
   const citations = (item.citations ?? []).filter((c) => c.url && c.quote)
 
@@ -37,38 +95,67 @@ function ClaimCard({ item, kind }: { item: FactClaim; kind: "true" | "false" }) 
     <div className={`rounded-xl border p-5 text-left h-full flex flex-col ${shell}`}>
       <div className="flex flex-wrap items-center gap-3 mb-3">
         <span className={`text-xs font-bold uppercase tracking-wide ${badgeColor}`}>{badge}</span>
-        <span className="text-neutral-500 text-xs">
-          впевненість: <span className="text-white font-semibold">{confPct}%</span>
-        </span>
-        {item.provider && (
+        {kind !== "insufficient" && (
+          <span className="text-neutral-500 text-xs">
+            впевненість: <span className="text-white font-semibold">{confPct}%</span>
+          </span>
+        )}
+        {item.provider && kind !== "disputed" && (
           <span className="text-neutral-600 text-xs">{item.provider}</span>
         )}
       </div>
-      <div className="h-1.5 w-full rounded-full bg-black/60 overflow-hidden mb-3">
-        <div
-          className={`h-full rounded-full ${bar}`}
-          style={{ width: `${Math.min(100, Math.max(8, confPct))}%` }}
-        />
-      </div>
+      {kind !== "insufficient" && (
+        <div className="h-1.5 w-full rounded-full bg-black/60 overflow-hidden mb-3">
+          <div
+            className={`h-full rounded-full ${bar}`}
+            style={{ width: `${Math.min(100, Math.max(8, confPct))}%` }}
+          />
+        </div>
+      )}
       <p className="text-neutral-100 text-sm leading-relaxed font-medium">{item.claim}</p>
-      {citations.length > 0 && (
-        <div className="mt-3 space-y-2 border-t border-neutral-800/80 pt-3">
-          {citations.slice(0, 2).map((c, i) => (
-            <div key={`${c.url}-${i}`} className="text-xs text-neutral-400 leading-relaxed">
-              <a
-                href={c.url}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="text-red-400/90 hover:text-red-300 break-all"
-              >
-                {c.url.replace(/^https?:\/\//, "").slice(0, 72)}
-              </a>
-              <p className="mt-1 text-neutral-500 italic">«{c.quote}»</p>
+      {kind === "disputed" && (item.sideVerdicts?.length ?? 0) > 0 && (
+        <div className="mt-3 space-y-2 border-t border-amber-900/40 pt-3">
+          <p className="text-[11px] uppercase tracking-wide text-amber-500/80 font-semibold">
+            Вердикти провайдерів
+          </p>
+          {item.sideVerdicts!.map((sv, i) => (
+            <div key={`${sv.provider}-${i}`} className="text-xs text-neutral-400 leading-relaxed">
+              <span className="text-neutral-300 font-medium">
+                {sv.provider || "провайдер"}: {sideVerdictLabel(sv.verdict)}
+              </span>
+              <span className="text-neutral-600">
+                {" "}
+                ({Math.round(Math.max(0, Math.min(1, sv.confidence)) * 100)}%)
+              </span>
+              {sv.note && <p className="mt-1 text-neutral-500">{sv.note}</p>}
             </div>
           ))}
         </div>
       )}
-      {item.note && (
+      {citations.length > 0 && (
+        <div className="mt-3 space-y-2 border-t border-neutral-800/80 pt-3">
+          {citations.slice(0, 2).map((c, i) => {
+            const scopeNote = verificationScopeLabel(c.verificationScope)
+            return (
+              <div key={`${c.url}-${i}`} className="text-xs text-neutral-400 leading-relaxed">
+                <a
+                  href={c.url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-red-400/90 hover:text-red-300 break-all"
+                >
+                  {c.url.replace(/^https?:\/\//, "").slice(0, 72)}
+                </a>
+                <p className="mt-1 text-neutral-500 italic">«{c.quote}»</p>
+                {scopeNote && (
+                  <p className="mt-1 text-[11px] text-neutral-600">{scopeNote}</p>
+                )}
+              </div>
+            )
+          })}
+        </div>
+      )}
+      {item.note && kind !== "disputed" && (
         <p className="mt-3 text-xs text-neutral-500 leading-relaxed border-t border-neutral-800/80 pt-3">
           {item.note}
         </p>
@@ -115,32 +202,85 @@ function mergeFactClaims(
 ): {
   supported: FactClaim[]
   contradicted: FactClaim[]
+  disputed: FactClaim[]
+  insufficient: FactClaim[]
 } {
   const supported: FactClaim[] = []
   const contradicted: FactClaim[] = []
+  const insufficient: FactClaim[] = []
 
   for (const fc of factChecks) {
     for (const c of fc.claims ?? []) {
       if (!c.claim.trim()) continue
       const citations = (c.citations ?? []).filter((x) => x.url && x.quote)
-      if (!citations.length) continue
-      const item = { ...c, citations, provider: c.provider || fc.provider }
-      if (c.verdict === "SUPPORTED") supported.push(item)
-      else if (c.verdict === "CONTRADICTED") contradicted.push(item)
+      const item: FactClaim = {
+        ...c,
+        citations,
+        provider: c.provider || fc.provider,
+      }
+      if (c.verdict === "SUPPORTED") {
+        if (!citations.length) continue
+        supported.push(item)
+      } else if (c.verdict === "CONTRADICTED") {
+        if (!citations.length) continue
+        contradicted.push(item)
+      } else if (c.verdict === "NOT_ENOUGH_INFO") {
+        insufficient.push(item)
+      }
     }
   }
 
   const supportedD = dedupeClaims(supported)
   const contradictedD = dedupeClaims(contradicted)
-  const supportedOk = supportedD
-    .filter((s) => !contradictedD.some((x) => claimsNearDuplicate(s.claim, x.claim)))
+  const insufficientD = dedupeClaims(insufficient)
+
+  const disputed: FactClaim[] = []
+  const usedContradicted = new Set<number>()
+  const supportedOk: FactClaim[] = []
+
+  for (const s of supportedD) {
+    const idx = contradictedD.findIndex(
+      (x, i) => !usedContradicted.has(i) && claimsNearDuplicate(s.claim, x.claim),
+    )
+    if (idx >= 0) {
+      const c = contradictedD[idx]
+      usedContradicted.add(idx)
+      disputed.push({
+        claim: s.claim.length >= c.claim.length ? s.claim : c.claim,
+        verdict: "DISPUTED",
+        confidence: Math.max(s.confidence, c.confidence),
+        citations: [...(s.citations ?? []), ...(c.citations ?? [])].slice(0, 4),
+        sideVerdicts: [
+          {
+            provider: s.provider,
+            verdict: "SUPPORTED",
+            confidence: s.confidence,
+            note: s.note,
+          },
+          {
+            provider: c.provider,
+            verdict: "CONTRADICTED",
+            confidence: c.confidence,
+            note: c.note,
+          },
+        ],
+      })
+    } else {
+      supportedOk.push(s)
+    }
+  }
+
+  const contradictedOk = contradictedD.filter((_, i) => !usedContradicted.has(i))
+  const taken = [...supportedOk, ...contradictedOk, ...disputed]
+  const insufficientOk = insufficientD
+    .filter((n) => !taken.some((x) => claimsNearDuplicate(n.claim, x.claim)))
     .slice(0, 6)
-  const contradictedOk = contradictedD
-    .filter((c) => !supportedD.some((x) => claimsNearDuplicate(c.claim, x.claim)))
-    .slice(0, 6)
+
   return {
-    supported: supportedOk,
-    contradicted: contradictedOk,
+    supported: supportedOk.slice(0, 6),
+    contradicted: contradictedOk.slice(0, 6),
+    disputed: disputed.slice(0, 6),
+    insufficient: insufficientOk,
   }
 }
 
@@ -191,7 +331,12 @@ interface ResultsSectionProps {
         claim: string
         verdict: "SUPPORTED" | "CONTRADICTED" | "NOT_ENOUGH_INFO"
         confidence: number
-        citations: { sourceIndex: number; url: string; quote: string }[]
+        citations: {
+          sourceIndex: number
+          url: string
+          quote: string
+          verificationScope?: "search_snippet" | "full_page"
+        }[]
         note?: string
       }[]
       sourcesUsed: { url: string; title?: string }[]
@@ -214,7 +359,12 @@ interface ResultsSectionProps {
         claim: string
         verdict: "SUPPORTED" | "CONTRADICTED" | "NOT_ENOUGH_INFO"
         confidence: number
-        citations: { sourceIndex: number; url: string; quote: string }[]
+        citations: {
+          sourceIndex: number
+          url: string
+          quote: string
+          verificationScope?: "search_snippet" | "full_page"
+        }[]
         note?: string
       }[]
       sourcesUsed: { url: string; title?: string }[]
@@ -252,7 +402,17 @@ export default function ResultsSection({ result }: ResultsSectionProps) {
       : result.factCheck
         ? [result.factCheck]
         : []
-  const { supported: trueFacts, contradicted: falseFacts } = mergeFactClaims(factChecks)
+  const {
+    supported: trueFacts,
+    contradicted: falseFacts,
+    disputed: disputedFacts,
+    insufficient: insufficientFacts,
+  } = mergeFactClaims(factChecks)
+  const hasKeyFacts =
+    trueFacts.length > 0 ||
+    falseFacts.length > 0 ||
+    disputedFacts.length > 0 ||
+    insufficientFacts.length > 0
 
   return (
     <section id="results" className="w-full min-h-screen px-4 bg-black border-t border-neutral-900 flex flex-col">
@@ -379,7 +539,7 @@ export default function ResultsSection({ result }: ResultsSectionProps) {
           </div>
         )}
 
-        {(trueFacts.length > 0 || falseFacts.length > 0) && (
+        {hasKeyFacts && (
           <div className="mb-12">
             <h3 className="text-2xl font-bold text-white mb-8">Ключові факти</h3>
 
@@ -422,6 +582,44 @@ export default function ResultsSection({ result }: ResultsSectionProps) {
                 </div>
               )}
             </div>
+
+            {disputedFacts.length > 0 && (
+              <div className="mt-10">
+                <div className="flex items-center gap-3 mb-4">
+                  <span className="inline-block w-1 h-6 bg-amber-500 rounded" />
+                  <div>
+                    <h4 className="text-lg font-semibold text-white">Суперечливі</h4>
+                    <p className="text-xs text-neutral-600">
+                      Провайдери дали протилежні вердикти щодо того самого твердження
+                    </p>
+                  </div>
+                </div>
+                <div className="grid sm:grid-cols-2 gap-4">
+                  {disputedFacts.map((item, idx) => (
+                    <ClaimCard key={`d-${idx}`} item={item} kind="disputed" />
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {insufficientFacts.length > 0 && (
+              <div className="mt-10">
+                <div className="flex items-center gap-3 mb-4">
+                  <span className="inline-block w-1 h-6 bg-neutral-500 rounded" />
+                  <div>
+                    <h4 className="text-lg font-semibold text-white">Недостатньо даних</h4>
+                    <p className="text-xs text-neutral-600">
+                      Правдивість не встановлено через брак перевірених доказів
+                    </p>
+                  </div>
+                </div>
+                <div className="grid sm:grid-cols-2 gap-4">
+                  {insufficientFacts.map((item, idx) => (
+                    <ClaimCard key={`n-${idx}`} item={item} kind="insufficient" />
+                  ))}
+                </div>
+              </div>
+            )}
           </div>
         )}
 

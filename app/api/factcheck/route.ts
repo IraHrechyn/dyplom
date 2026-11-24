@@ -7,7 +7,12 @@ type FactCheckClaim = {
   claim: string
   verdict: "SUPPORTED" | "CONTRADICTED" | "NOT_ENOUGH_INFO"
   confidence: number
-  citations: { sourceIndex: number; url: string; quote: string }[]
+  citations: {
+    sourceIndex: number
+    url: string
+    quote: string
+    verificationScope?: "search_snippet" | "full_page"
+  }[]
   note?: string
 }
 
@@ -229,11 +234,16 @@ async function collectEvidenceHits(
   return dedupeHits(hits, 4)
 }
 
-async function gatherSourceTexts(
-  hits: SearchHit[],
-  maxPages = 3,
-): Promise<{ url: string; title?: string; text: string; publisher?: string }[]> {
-  const out: { url: string; title?: string; text: string; publisher?: string }[] = []
+type SourceText = {
+  url: string
+  title?: string
+  text: string
+  publisher?: string
+  verificationScope: "search_snippet" | "full_page"
+}
+
+async function gatherSourceTexts(hits: SearchHit[], maxPages = 3): Promise<SourceText[]> {
+  const out: SourceText[] = []
   for (const h of hits) {
     const sn = (h.snippet ?? h.title ?? "").trim()
     if (sn.length < 15) continue
@@ -242,6 +252,7 @@ async function gatherSourceTexts(
       title: h.title,
       publisher: h.publisher,
       text: `SEARCH HIT: ${String(h.title ?? "").slice(0, 200)}\n${sn.slice(0, 700)}`,
+      verificationScope: "search_snippet",
     })
     if (out.length >= maxPages) break
   }
@@ -253,13 +264,16 @@ function clamp01(n: number) {
   return Math.max(0, Math.min(1, n))
 }
 
-function normalizePercents(truth: number, fake: number): { truthPercent: number; fakePercent: number } {
-  let t = Number.isFinite(truth) ? truth : 0
-  let f = Number.isFinite(fake) ? fake : 0
-  t = Math.max(0, Math.min(100, t))
-  f = Math.max(0, Math.min(100, f))
+function normalizePercents(
+  truth: number,
+  fake: number,
+): { truthPercent: number; fakePercent: number } | null {
+  if (!Number.isFinite(truth) || !Number.isFinite(fake)) return null
+  if (truth < 0 || truth > 100 || fake < 0 || fake > 100) return null
+  let t = truth
+  let f = fake
   const sum = t + f
-  if (sum <= 0) return { truthPercent: 50, fakePercent: 50 }
+  if (sum <= 0) return null
   if (Math.abs(sum - 100) > 0.05) {
     t = (t / sum) * 100
     f = 100 - t
@@ -281,16 +295,24 @@ function quoteMatchesSource(quote: string, sourceText: string): boolean {
   const q = normalizeMatchText(quote)
   const src = normalizeMatchText(sourceText)
   if (q.length < 12 || !src) return false
-  if (src.includes(q)) return true
-  const head = q.slice(0, Math.min(80, q.length))
-  return head.length >= 12 && src.includes(head)
+  return src.includes(q)
 }
 
 function verifyCitations(
   citations: { sourceIndex: number; url: string; quote: string }[],
-  sourceTexts: { url: string; title?: string; text: string; publisher?: string }[],
-): { sourceIndex: number; url: string; quote: string }[] {
-  const out: { sourceIndex: number; url: string; quote: string }[] = []
+  sourceTexts: SourceText[],
+): {
+  sourceIndex: number
+  url: string
+  quote: string
+  verificationScope: "search_snippet" | "full_page"
+}[] {
+  const out: {
+    sourceIndex: number
+    url: string
+    quote: string
+    verificationScope: "search_snippet" | "full_page"
+  }[] = []
   for (const c of citations) {
     const idx = sourceTexts.findIndex(
       (s) => s.url === c.url || s.url.includes(c.url) || c.url.includes(s.url),
@@ -303,6 +325,7 @@ function verifyCitations(
       sourceIndex: idx,
       url: src.url,
       quote: c.quote.slice(0, 220),
+      verificationScope: src.verificationScope,
     })
   }
   return out
@@ -346,20 +369,31 @@ function buildFactCheckPayload(
   const plausibilityOnly = hasEvidence ? false : Boolean(parsed?.plausibility_only)
   const overallIn = parsed?.overall ?? {}
   const normalized = normalizePercents(
-    Number(overallIn?.truth_percent ?? 0),
-    Number(overallIn?.fake_percent ?? 0),
+    Number(overallIn?.truth_percent),
+    Number(overallIn?.fake_percent),
   )
   let overallVerdict = overallIn?.verdict
   if (!hasEvidence && (overallVerdict === "LIKELY_TRUE" || overallVerdict === "LIKELY_FALSE")) {
     overallVerdict = "NOT_ENOUGH_INFO"
   }
-  const overall = {
-    truthPercent: normalized.truthPercent,
-    fakePercent: normalized.fakePercent,
-    confidence: clamp01(Number(overallIn?.confidence ?? 0)),
-    verdict: overallVerdict,
-    summary: String(overallIn?.summary ?? "").trim(),
+  if (!normalized) {
+    overallVerdict = "NOT_ENOUGH_INFO"
   }
+  const overall = normalized
+    ? {
+        truthPercent: normalized.truthPercent,
+        fakePercent: normalized.fakePercent,
+        confidence: clamp01(Number(overallIn?.confidence ?? 0)),
+        verdict: overallVerdict,
+        summary: String(overallIn?.summary ?? "").trim(),
+      }
+    : {
+        truthPercent: 50,
+        fakePercent: 50,
+        confidence: 0,
+        verdict: "NOT_ENOUGH_INFO" as const,
+        summary: String(overallIn?.summary ?? "").trim() || "Оцінки поза діапазоном 0–100 відхилено.",
+      }
 
   const analysis = String(parsed?.analysis ?? "").trim()
   const redFlags = filterInventedOfficeFlags(
@@ -596,9 +630,10 @@ export async function POST(req: NextRequest) {
     "- Не став CONTRADICTED лише через те, що з опорної дати вже минув час до «сьогодні».",
     "",
     "Правила чисел:",
-    "- truth_percent і fake_percent лише в діапазоні 0–100; їхня сума = 100.",
+    "- truth_percent і fake_percent лише в діапазоні 0–100; їхня сума = 100. Значення поза 0–100 будуть відхилені.",
     "- confidence від 0 до 1 — чесна оцінка моделі, БЕЗ штучного завищення.",
     "- SUPPORTED / CONTRADICTED лише з evidence: url+quote, які реально є в SOURCES.",
+    "- evidence.quote має бути дослівним фрагментом із відповідного джерела в SOURCES (повний збіг, без зміни закінчення).",
     "- Якщо цитати з SOURCES немає — став NOT_ENOUGH_INFO, навіть якщо здається правдоподібним.",
     "- Цитати до 220 символів. Не вигадуй URL і цитати.",
     "- analysis: 2–3 речення українською.",

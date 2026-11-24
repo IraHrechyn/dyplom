@@ -83,12 +83,34 @@ def _format_facts(title: str, items: list[dict], *, empty_hint: str) -> str:
                 continue
             url = str(cit.get("url") or "").strip()
             quote = str(cit.get("quote") or "").strip()
+            scope = str(cit.get("verificationScope") or "").strip()
             if url:
                 lines.append(f"   🔗 {_esc(_clip(url, 120))}")
             if quote:
                 lines.append(f"   <i>«{_esc(_clip(quote, 160))}»</i>")
+            if scope == "search_snippet":
+                lines.append("   <i>звірка з пошуковим уривком</i>")
+            elif scope == "full_page":
+                lines.append("   <i>звірка з повним текстом джерела</i>")
+        sides = fr.get("sideVerdicts") if isinstance(fr.get("sideVerdicts"), list) else []
+        for sv in sides[:4]:
+            if not isinstance(sv, dict):
+                continue
+            prov = str(sv.get("provider") or "провайдер").strip()
+            verd = str(sv.get("verdict") or "").strip()
+            label = {
+                "SUPPORTED": "підтверджено",
+                "CONTRADICTED": "спростовано",
+                "NOT_ENOUGH_INFO": "недостатньо даних",
+            }.get(verd, verd or "?")
+            conf = sv.get("confidence")
+            conf_s = f" ({int(round(float(conf) * 100))}%)" if conf is not None else ""
+            lines.append(f"   • {_esc(prov)}: {_esc(label)}{_esc(conf_s)}")
+            side_note = str(sv.get("note") or "").strip()
+            if side_note:
+                lines.append(f"     <i>{_esc(_clip(side_note, 140))}</i>")
         note = (fr.get("note") or "").strip()
-        if note:
+        if note and not sides:
             lines.append(f"   <i>{_esc(_clip(note, 180))}</i>")
     return "\n".join(lines) + "\n"
 
@@ -97,6 +119,8 @@ def format_result(result: dict, *, input_kind: str, ocr_preview: str | None = No
     consensus = result.get("factCheckConsensus") or {}
     true_facts = result.get("trueFacts") or []
     false_facts = result.get("falseFacts") or []
+    disputed_facts = result.get("disputedFacts") or []
+    insufficient_facts = result.get("insufficientFacts") or []
     combined = result.get("combined") or {}
 
     kind_labels = {
@@ -150,7 +174,13 @@ def format_result(result: dict, *, input_kind: str, ocr_preview: str | None = No
     if false_facts:
         parts.append("")
         parts.append(_format_facts("❌ Неправдиві факти", false_facts, empty_hint=""))
-    if not true_facts and not false_facts:
+    if disputed_facts:
+        parts.append("")
+        parts.append(_format_facts("⚠️ Суперечливі", disputed_facts, empty_hint=""))
+    if insufficient_facts:
+        parts.append("")
+        parts.append(_format_facts("❔ Недостатньо даних", insufficient_facts, empty_hint=""))
+    if not true_facts and not false_facts and not disputed_facts and not insufficient_facts:
         parts.append("")
         parts.append("<i>Ключових підтверджених чи спростованих фактів не виділено.</i>")
 
