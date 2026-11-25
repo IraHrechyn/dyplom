@@ -2,10 +2,8 @@
 
 | File | Purpose |
 |------|---------|
-| `ua_news_1000_1000.csv` | UA TF-IDF (`\|` separator; 
-`0=fake`, `1=real`) |
-| `WELFake_Dataset.csv` | English BiLSTM (`0=real`, 
-`1=fake` in this dump) |
+| `ua_news_1000_1000.csv` | UA TF-IDF (роздільник `\|`; мітки `0=fake`, `1=real`; у git) |
+| `WELFake_Dataset.csv` | English BiLSTM (мітки `0=real`, `1=fake`; не в git — покладіть локально) |
 
 ## Звіти запуску
 
