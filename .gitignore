@@ -19,7 +19,9 @@ __pycache__/
 /data/*
 !/data/README.md
 !/data/*_run_report.md
+!/data/ua_news_1000_1000.csv
 *.csv
+!/data/ua_news_1000_1000.csv
 _docx_edit*/
 *.bak*
 AGENTS.md

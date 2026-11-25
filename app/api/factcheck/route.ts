@@ -363,7 +363,7 @@ function dedupeHits(hits: SearchHit[], limit: number): SearchHit[] {
 function buildFactCheckPayload(
   llm: LlmConfig,
   parsed: any,
-  sourceTexts: { url: string; title?: string; text: string; publisher?: string }[],
+  sourceTexts: SourceText[],
 ): FactCheckResponse {
   const hasEvidence = sourceTexts.length > 0
   const plausibilityOnly = hasEvidence ? false : Boolean(parsed?.plausibility_only)
